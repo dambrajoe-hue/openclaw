@@ -21,6 +21,7 @@ import { getSlashCommands } from "./commands.js";
 import { ChatLog } from "./components/chat-log.js";
 import { CustomEditor } from "./components/custom-editor.js";
 import { GatewayChatClient } from "./gateway-chat.js";
+import { SessionJsonlWatcher } from "./session-jsonl-watcher.js";
 import { editorTheme, theme } from "./theme/theme.js";
 import { createCommandHandlers } from "./tui-command-handlers.js";
 import { createEventHandlers } from "./tui-event-handlers.js";
@@ -725,10 +726,28 @@ export async function runTui(opts: TuiOptions) {
     refreshAgents,
     refreshSessionInfo,
     applySessionInfoFromPatch,
-    loadHistory,
+    loadHistory: baseLoadHistory,
     setSession,
     abortActive,
   } = sessionActions;
+
+  // External-write watcher: re-renders the session view when another process
+  // (inbox wake-handlers, crons, sibling agents) appends to the session JSONL.
+  // Without this, async work that lands in the session is invisible until the
+  // user fires the next turn.
+  let externalWatcher: SessionJsonlWatcher | null = null;
+  const loadHistory = async (): Promise<void> => {
+    await baseLoadHistory();
+    if (externalWatcher && currentAgentId && currentSessionId) {
+      await externalWatcher.start(currentAgentId, currentSessionId);
+    }
+  };
+  externalWatcher = new SessionJsonlWatcher({
+    onExternalWrite: () => {
+      setConnectionStatus("session updated externally — refreshing", 3000);
+      void loadHistory();
+    },
+  });
 
   const { handleChatEvent, handleAgentEvent, handleBtwEvent } = createEventHandlers({
     chatLog,
@@ -753,6 +772,7 @@ export async function runTui(opts: TuiOptions) {
     }
     exitRequested = true;
     client.stop();
+    void externalWatcher?.stop();
     void drainAndStopTuiSafely(tui).then(() => {
       process.exit(0);
     });
