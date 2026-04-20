@@ -34,6 +34,12 @@ import type { WebInboundMessage, WebListenerCloseReason } from "./types.js";
 const LOGGED_OUT_STATUS = DisconnectReason?.loggedOut ?? 401;
 const RECONNECT_IN_PROGRESS_ERROR = "no active socket - reconnection in progress";
 
+type DebounceTypingDecision =
+  | boolean
+  | {
+      shouldStart: boolean;
+    };
+
 function logWhatsAppVerbose(enabled: boolean | undefined, message: string) {
   if (!enabled) {
     return;
@@ -57,6 +63,8 @@ function isNonEmptyString(value: string | undefined): value is string {
   return Boolean(value);
 }
 
+const DEBOUNCE_TYPING_REFRESH_MS = 5_000;
+
 export type MonitorWebInboxOptions = {
   verbose: boolean;
   accountId: string;
@@ -71,6 +79,10 @@ export type MonitorWebInboxOptions = {
   debounceMs?: number;
   /** Optional debounce gating predicate. */
   shouldDebounce?: (msg: WebInboundMessage) => boolean;
+  /** Optional guard for starting debounce-window typing before normal reply handling. */
+  shouldStartDebounceTyping?: (
+    msg: WebInboundMessage,
+  ) => DebounceTypingDecision | Promise<DebounceTypingDecision>;
   /** Optional shared socket reference so reply closures can follow reconnects. */
   socketRef?: { current: WASocket | null };
   /** Whether send retries should wait for a reconnect. */
@@ -144,6 +156,81 @@ export async function attachWebInboxToSocket(
   type QueuedInboundMessage = WebInboundMessage & {
     dedupeKey?: string;
   };
+  type DebounceKeyMessage = Pick<
+    QueuedInboundMessage,
+    | "accountId"
+    | "chatType"
+    | "chatId"
+    | "from"
+    | "sender"
+    | "senderJid"
+    | "senderE164"
+    | "senderName"
+  >;
+
+  const buildDebounceKey = (msg: DebounceKeyMessage): string | null => {
+    const sender = msg.sender;
+    const senderKey =
+      msg.chatType === "group"
+        ? (getPrimaryIdentityId(sender ?? null) ??
+          msg.senderJid ??
+          msg.senderE164 ??
+          msg.senderName ??
+          msg.from)
+        : msg.from;
+    if (!senderKey) {
+      return null;
+    }
+    const conversationKey = msg.chatType === "group" ? msg.chatId : msg.from;
+    return `${msg.accountId}:${conversationKey}:${senderKey}`;
+  };
+  const pendingDebounceTyping = new Map<
+    string,
+    { timeout: ReturnType<typeof setTimeout> | null }
+  >();
+
+  const stopPendingDebounceTyping = (key: string | null | undefined) => {
+    if (!key) {
+      return;
+    }
+    const pending = pendingDebounceTyping.get(key);
+    if (!pending) {
+      return;
+    }
+    if (pending.timeout) {
+      clearTimeout(pending.timeout);
+    }
+    pendingDebounceTyping.delete(key);
+  };
+
+  const startPendingDebounceTyping = (key: string, sendComposing: () => Promise<void>) => {
+    if (pendingDebounceTyping.has(key)) {
+      return;
+    }
+    const pending = { timeout: null as ReturnType<typeof setTimeout> | null };
+    pendingDebounceTyping.set(key, pending);
+
+    const tick = async () => {
+      if (pendingDebounceTyping.get(key) !== pending) {
+        return;
+      }
+      await sendComposing();
+      if (pendingDebounceTyping.get(key) !== pending) {
+        return;
+      }
+      pending.timeout = setTimeout(() => {
+        void tick();
+      }, DEBOUNCE_TYPING_REFRESH_MS);
+    };
+
+    void tick();
+  };
+
+  const stopAllPendingDebounceTyping = () => {
+    for (const key of pendingDebounceTyping.keys()) {
+      stopPendingDebounceTyping(key);
+    }
+  };
 
   const finalizeInboundDedupe = async (
     entries: QueuedInboundMessage[],
@@ -164,28 +251,14 @@ export async function attachWebInboxToSocket(
 
   const debouncer = createInboundDebouncer<QueuedInboundMessage>({
     debounceMs: options.debounceMs ?? 0,
-    buildKey: (msg) => {
-      const sender = msg.sender;
-      const senderKey =
-        msg.chatType === "group"
-          ? (getPrimaryIdentityId(sender ?? null) ??
-            msg.senderJid ??
-            msg.senderE164 ??
-            msg.senderName ??
-            msg.from)
-          : msg.from;
-      if (!senderKey) {
-        return null;
-      }
-      const conversationKey = msg.chatType === "group" ? msg.chatId : msg.from;
-      return `${msg.accountId}:${conversationKey}:${senderKey}`;
-    },
+    buildKey: buildDebounceKey,
     shouldDebounce: options.shouldDebounce,
     onFlush: async (entries) => {
       const last = entries.at(-1);
       if (!last) {
         return;
       }
+      stopPendingDebounceTyping(buildDebounceKey(last));
       try {
         if (entries.length === 1) {
           await options.onMessage(last);
@@ -577,13 +650,42 @@ export async function attachWebInboxToSocket(
       mediaFileName: enriched.mediaFileName,
       dedupeKey: inbound.id ? `${options.accountId}:${inbound.remoteJid}:${inbound.id}` : undefined,
     };
+    const debounceKey = buildDebounceKey(inboundMessage);
+    const shouldDebounceInbound =
+      (options.debounceMs ?? 0) > 0 && (options.shouldDebounce?.(inboundMessage) ?? true);
+    if (
+      shouldDebounceInbound &&
+      inboundMessage.chatType === "direct" &&
+      !inbound.access.isSelfChat
+    ) {
+      let shouldStartDebounceTyping = true;
+      if (options.shouldStartDebounceTyping) {
+        try {
+          const decision = await options.shouldStartDebounceTyping(inboundMessage);
+          if (typeof decision === "object" && decision !== null) {
+            shouldStartDebounceTyping = decision.shouldStart;
+          } else {
+            shouldStartDebounceTyping = decision;
+          }
+        } catch (err) {
+          shouldStartDebounceTyping = false;
+          logWhatsAppVerbose(options.verbose, `Debounce typing precheck failed: ${String(err)}`);
+        }
+      }
+      if (debounceKey && shouldStartDebounceTyping) {
+        // Keep a visible typing indicator alive while DMs are intentionally buffered.
+        startPendingDebounceTyping(debounceKey, sendComposing);
+      }
+    }
     try {
       const task = Promise.resolve(debouncer.enqueue(inboundMessage));
       void task.catch((err) => {
+        stopPendingDebounceTyping(debounceKey);
         inboundLogger.error({ error: String(err) }, "failed handling inbound web message");
         inboundConsoleLog.error(`Failed handling inbound web message: ${String(err)}`);
       });
     } catch (err) {
+      stopPendingDebounceTyping(debounceKey);
       inboundLogger.error({ error: String(err) }, "failed handling inbound web message");
       inboundConsoleLog.error(`Failed handling inbound web message: ${String(err)}`);
     }
@@ -704,6 +806,7 @@ export async function attachWebInboxToSocket(
   return {
     close: async () => {
       try {
+        stopAllPendingDebounceTyping();
         detachMessagesUpsert();
         detachConnectionUpdate();
         closeInboundMonitorSocket(sock);
