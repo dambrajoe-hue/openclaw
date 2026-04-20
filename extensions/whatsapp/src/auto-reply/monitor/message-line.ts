@@ -1,13 +1,13 @@
 import type { loadConfig } from "openclaw/plugin-sdk/config-runtime";
 import { getPrimaryIdentityId, getReplyContext, getSenderIdentity } from "../../identity.js";
-import type { WebInboundMsg } from "../types.js";
+import type { WhatsAppInboundMessageContract } from "./inbound-message-contract.js";
 import {
   formatInboundEnvelope,
   resolveMessagePrefix,
   type EnvelopeFormatOptions,
 } from "./message-line.runtime.js";
 
-export function formatReplyContext(msg: WebInboundMsg) {
+export function formatReplyContext(msg: WhatsAppInboundMessageContract) {
   const replyTo = getReplyContext(msg);
   if (!replyTo?.body) {
     return null;
@@ -19,7 +19,7 @@ export function formatReplyContext(msg: WebInboundMsg) {
 
 export function buildInboundLine(params: {
   cfg: ReturnType<typeof loadConfig>;
-  msg: WebInboundMsg;
+  msg: WhatsAppInboundMessageContract;
   agentId: string;
   previousTimestamp?: number;
   envelope?: EnvelopeFormatOptions;

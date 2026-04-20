@@ -54,7 +54,7 @@ export {
   drainSessionStoreLockQueuesForTest,
   getSessionStoreLockQueueSizeForTest,
 } from "./store-lock-state.js";
-export { loadSessionStore } from "./store-load.js";
+export { loadSessionStore, loadSessionStoreAsync } from "./store-load.js";
 export { normalizeStoreSessionKey, resolveSessionStoreEntry } from "./store-entry.js";
 
 const log = createSubsystemLogger("sessions/store");

@@ -189,12 +189,22 @@ export function createWebListenerFactoryCapture(): AnyExport {
         onMessage: (msg: WebInboundMessage) => Promise<void>;
         debounceMs?: number;
         selfChatMode?: boolean;
+        shouldStartDebounceTyping?: (
+          msg: WebInboundMessage,
+        ) =>
+          | boolean
+          | Promise<boolean>
+          | { shouldStart: boolean }
+          | Promise<{ shouldStart: boolean }>;
       }
     | undefined;
   const listenerFactory = async (opts: {
     onMessage: (msg: WebInboundMessage) => Promise<void>;
     debounceMs?: number;
     selfChatMode?: boolean;
+    shouldStartDebounceTyping?: (
+      msg: WebInboundMessage,
+    ) => boolean | Promise<boolean> | { shouldStart: boolean } | Promise<{ shouldStart: boolean }>;
   }) => {
     capturedOnMessage = opts.onMessage;
     capturedOptions = opts;

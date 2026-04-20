@@ -32,6 +32,7 @@ import { getRuntimeConfigSourceSnapshot, loadConfig } from "./config.runtime.js"
 import { whatsappHeartbeatLog, whatsappLog } from "./loggers.js";
 import { buildMentionConfig } from "./mentions.js";
 import { createWebChannelStatusController } from "./monitor-state.js";
+import { resolveWhatsAppDirectReplyAdmission } from "./monitor/direct-reply-admission.js";
 import { createEchoTracker } from "./monitor/echo.js";
 import { createWebOnMessageHandler } from "./monitor/on-message.js";
 import type { WebInboundMsg, WebMonitorTuning } from "./types.js";
@@ -94,6 +95,21 @@ function isRetryableAuthUnstableError(error: unknown): error is WhatsAppAuthUnst
       "code" in error &&
       (error as { code?: unknown }).code === WHATSAPP_AUTH_UNSTABLE_CODE)
   );
+}
+
+async function shouldStartWhatsAppDebounceTyping(params: {
+  cfg: ReturnType<typeof loadConfig>;
+  msg: WebInboundMsg & { chatType: "direct" };
+  echoHas: (key: string) => boolean;
+  buildCombinedEchoKey: (params: { sessionKey: string; combinedBody: string }) => string;
+}): Promise<boolean> {
+  const admission = await resolveWhatsAppDirectReplyAdmission({
+    cfg: params.cfg,
+    msg: params.msg,
+    echoHas: params.echoHas,
+    buildCombinedEchoKey: params.buildCombinedEchoKey,
+  });
+  return admission.replyAdmission.shouldStartEarlyTyping;
 }
 
 export async function monitorWebChannel(
@@ -255,6 +271,18 @@ export async function monitorWebChannel(
               sendReadReceipts: account.sendReadReceipts,
               debounceMs: inboundDebounceMs,
               shouldDebounce,
+              shouldStartDebounceTyping: async (msg: WebInboundMsg) => {
+                if (msg.chatType !== "direct") {
+                  return false;
+                }
+                const directMsg = msg as WebInboundMsg & { chatType: "direct" };
+                return shouldStartWhatsAppDebounceTyping({
+                  cfg: loadConfig(),
+                  msg: directMsg,
+                  echoHas: echoTracker.has,
+                  buildCombinedEchoKey: echoTracker.buildCombinedKey,
+                });
+              },
               socketRef: controller.socketRef,
               shouldRetryDisconnect: () => !sigintStop && controller.shouldRetryDisconnect(),
               disconnectRetryPolicy: reconnectPolicy,

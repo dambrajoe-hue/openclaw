@@ -96,16 +96,18 @@ export async function processMessage(params: {
     channel: "whatsapp",
     accountId: account.accountId,
   });
-  const { storePath, envelopeOptions, previousTimestamp } = resolveInboundSessionEnvelopeContext({
+  const sessionEnvelope = resolveInboundSessionEnvelopeContext({
     cfg: params.cfg,
     agentId: params.route.agentId,
     sessionKey: params.route.sessionKey,
   });
+  const storePath = sessionEnvelope.storePath;
+  const envelopeOptions = sessionEnvelope?.envelopeOptions;
   let combinedBody = buildInboundLine({
     cfg: params.cfg,
     msg: params.msg,
     agentId: params.route.agentId,
-    previousTimestamp,
+    previousTimestamp: sessionEnvelope?.previousTimestamp,
     envelope: envelopeOptions,
   });
   let shouldClearGroupHistory = false;

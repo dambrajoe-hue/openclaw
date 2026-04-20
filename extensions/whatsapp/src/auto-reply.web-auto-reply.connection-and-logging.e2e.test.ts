@@ -2,6 +2,7 @@ import "./test-helpers.js";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import { resolveAgentRoute } from "openclaw/plugin-sdk/routing";
 import { setLoggerOverride } from "openclaw/plugin-sdk/runtime-env";
 import { withEnvAsync } from "openclaw/plugin-sdk/testing";
 import { beforeAll, describe, expect, it, vi } from "vitest";
@@ -62,6 +63,20 @@ async function startWatchdogScenario(params: {
   });
 
   return { scripted, sleep, spies, ...started };
+}
+
+function readDebounceTypingDecision(
+  decision:
+    | boolean
+    | {
+        shouldStart: boolean;
+      }
+    | undefined,
+): boolean | undefined {
+  if (typeof decision === "object" && decision !== null) {
+    return decision.shouldStart;
+  }
+  return decision;
 }
 
 describe("web auto-reply connection", () => {
@@ -399,6 +414,276 @@ describe("web auto-reply connection", () => {
     expect(capture.getLastOptions()?.debounceMs).toBe(250);
   });
 
+  it("suppresses debounce typing when send policy denies delivery", async () => {
+    const capture = createWebListenerFactoryCapture();
+
+    setLoadConfigMock({
+      session: {
+        sendPolicy: {
+          default: "deny",
+        },
+      },
+      channels: {
+        whatsapp: {
+          debounceMs: 250,
+          allowFrom: ["*"],
+        },
+      },
+    } as OpenClawConfig);
+
+    await monitorWebChannel(false, capture.listenerFactory as never, false, async () => ({
+      text: "ok",
+    }));
+
+    const shouldStartDebounceTyping = capture.getLastOptions()?.shouldStartDebounceTyping;
+    expect(shouldStartDebounceTyping).toBeTypeOf("function");
+    await expect(
+      Promise.resolve(
+        shouldStartDebounceTyping?.({
+          body: "hello",
+          from: "+15550001111",
+          conversationId: "+15550001111",
+          to: "+15550009999",
+          accountId: "default",
+          chatType: "direct",
+          chatId: "direct:+15550001111",
+          id: "m1",
+          sendComposing: vi.fn(),
+          reply: vi.fn(),
+          sendMedia: vi.fn(),
+        } as never),
+      ).then(readDebounceTypingDecision),
+    ).resolves.toBe(false);
+
+    resetLoadConfigMock();
+  });
+
+  it("suppresses debounce typing for silent unauthorized whole-message commands", async () => {
+    const capture = createWebListenerFactoryCapture();
+
+    setLoadConfigMock({
+      channels: {
+        whatsapp: {
+          debounceMs: 250,
+          dmPolicy: "open",
+        },
+      },
+    } as OpenClawConfig);
+
+    await monitorWebChannel(false, capture.listenerFactory as never, false, async () => ({
+      text: "ok",
+    }));
+
+    const shouldStartDebounceTyping = capture.getLastOptions()?.shouldStartDebounceTyping;
+    expect(shouldStartDebounceTyping).toBeTypeOf("function");
+    await expect(
+      Promise.resolve(
+        shouldStartDebounceTyping?.({
+          body: "/reset",
+          from: "+15550001111",
+          conversationId: "+15550001111",
+          to: "+15550009999",
+          accountId: "default",
+          chatType: "direct",
+          chatId: "direct:+15550001111",
+          id: "m1",
+          sendComposing: vi.fn(),
+          reply: vi.fn(),
+          sendMedia: vi.fn(),
+        } as never),
+      ).then(readDebounceTypingDecision),
+    ).resolves.toBe(false);
+
+    resetLoadConfigMock();
+  });
+
+  it("suppresses debounce typing for owner-gated commands from non-owners", async () => {
+    const capture = createWebListenerFactoryCapture();
+
+    setLoadConfigMock({
+      commands: {
+        config: true,
+        ownerAllowFrom: ["whatsapp:+15550009999"],
+      },
+      channels: {
+        whatsapp: {
+          debounceMs: 250,
+          allowFrom: ["*"],
+        },
+      },
+    } as OpenClawConfig);
+
+    await monitorWebChannel(false, capture.listenerFactory as never, false, async () => ({
+      text: "ok",
+    }));
+
+    const shouldStartDebounceTyping = capture.getLastOptions()?.shouldStartDebounceTyping;
+    expect(shouldStartDebounceTyping).toBeTypeOf("function");
+    await expect(
+      Promise.resolve(
+        shouldStartDebounceTyping?.({
+          body: "/config show",
+          from: "+15550001111",
+          conversationId: "+15550001111",
+          to: "+15550009999",
+          accountId: "default",
+          chatType: "direct",
+          chatId: "direct:+15550001111",
+          id: "m1",
+          sendComposing: vi.fn(),
+          reply: vi.fn(),
+          sendMedia: vi.fn(),
+        } as never),
+      ).then(readDebounceTypingDecision),
+    ).resolves.toBe(false);
+
+    resetLoadConfigMock();
+  });
+
+  it("suppresses debounce typing for echo-filtered inbound text", async () => {
+    const capture = createWebListenerFactoryCapture();
+    const replyResolver = vi.fn(async () => ({ text: "echo me" }));
+
+    setLoadConfigMock({
+      channels: {
+        whatsapp: {
+          debounceMs: 250,
+          allowFrom: ["*"],
+        },
+      },
+    } as OpenClawConfig);
+
+    await monitorWebChannel(false, capture.listenerFactory as never, false, replyResolver);
+
+    const capturedOnMessage = capture.getOnMessage();
+    expect(capturedOnMessage).toBeTypeOf("function");
+    await sendWebDirectInboundMessage({
+      onMessage: capturedOnMessage!,
+      body: "hello",
+      from: "+15550001111",
+      to: "+15550009999",
+      id: "seed-echo",
+      spies: {
+        sendMedia: vi.fn(),
+        reply: vi.fn().mockResolvedValue(undefined),
+        sendComposing: vi.fn(),
+      },
+    });
+    expect(replyResolver).toHaveBeenCalledTimes(1);
+
+    const shouldStartDebounceTyping = capture.getLastOptions()?.shouldStartDebounceTyping;
+    expect(shouldStartDebounceTyping).toBeTypeOf("function");
+    await expect(
+      Promise.resolve(
+        shouldStartDebounceTyping?.({
+          body: "echo me",
+          from: "+15550001111",
+          conversationId: "+15550001111",
+          to: "+15550009999",
+          accountId: "default",
+          chatType: "direct",
+          chatId: "direct:+15550001111",
+          id: "m1",
+          sendComposing: vi.fn(),
+          reply: vi.fn(),
+          sendMedia: vi.fn(),
+        } as never),
+      ).then(readDebounceTypingDecision),
+    ).resolves.toBe(false);
+
+    resetLoadConfigMock();
+  });
+
+  it("suppresses debounce typing for combined-echo duplicate direct turns", async () => {
+    const capture = createWebListenerFactoryCapture();
+    const replyResolver = vi.fn(async () => ({ text: "ok" }));
+    const timestamp = Date.UTC(2026, 3, 20, 12, 0, 0);
+    const cfg = {
+      session: {
+        store: "",
+      },
+      channels: {
+        whatsapp: {
+          debounceMs: 250,
+          allowFrom: ["*"],
+        },
+      },
+    } satisfies OpenClawConfig;
+    const route = resolveAgentRoute({
+      cfg,
+      channel: "whatsapp",
+      accountId: "default",
+      peer: {
+        kind: "direct",
+        id: "+15550001111",
+      },
+    });
+    const store = await makeSessionStore({
+      [route.sessionKey]: {
+        sessionId: "sid",
+        updatedAt: timestamp,
+      },
+    });
+    cfg.session.store = store.storePath;
+
+    try {
+      setLoadConfigMock(cfg);
+
+      await monitorWebChannel(false, capture.listenerFactory as never, false, replyResolver);
+
+      const capturedOnMessage = capture.getOnMessage();
+      expect(capturedOnMessage).toBeTypeOf("function");
+      await sendWebDirectInboundMessage({
+        onMessage: capturedOnMessage!,
+        body: "hello",
+        from: "+15550001111",
+        to: "+15550009999",
+        id: "seed-combined-echo",
+        timestamp,
+        spies: {
+          sendMedia: vi.fn(),
+          reply: vi.fn().mockResolvedValue(undefined),
+          sendComposing: vi.fn(),
+        },
+      });
+      expect(replyResolver).toHaveBeenCalledTimes(1);
+
+      await fs.writeFile(
+        store.storePath,
+        JSON.stringify({
+          [route.sessionKey]: {
+            sessionId: "sid",
+            updatedAt: timestamp,
+          },
+        }),
+      );
+
+      const shouldStartDebounceTyping = capture.getLastOptions()?.shouldStartDebounceTyping;
+      expect(shouldStartDebounceTyping).toBeTypeOf("function");
+      await expect(
+        Promise.resolve(
+          shouldStartDebounceTyping?.({
+            body: "hello",
+            from: "+15550001111",
+            conversationId: "+15550001111",
+            to: "+15550009999",
+            accountId: "default",
+            chatType: "direct",
+            chatId: "direct:+15550001111",
+            id: "dup-combined-echo",
+            timestamp,
+            sendComposing: vi.fn(),
+            reply: vi.fn(),
+            sendMedia: vi.fn(),
+          } as never),
+        ).then(readDebounceTypingDecision),
+      ).resolves.toBe(false);
+    } finally {
+      await store.cleanup();
+      resetLoadConfigMock();
+    }
+  });
+
   it("processes inbound messages without batching and preserves timestamps", async () => {
     await withEnvAsync({ TZ: "Europe/Vienna" }, async () => {
       const originalMax = process.getMaxListeners();
@@ -600,5 +885,45 @@ describe("web auto-reply connection", () => {
     resetLoadConfigMock();
 
     expect(markDispatchIdle).toHaveBeenCalled();
+  });
+
+  it("starts composing before reply resolution begins for accepted direct messages", async () => {
+    const sendComposing = vi.fn(async () => undefined);
+    const replyResolver = vi.fn(async () => {
+      expect(sendComposing).toHaveBeenCalledTimes(1);
+      return undefined;
+    });
+
+    setLoadConfigMock({
+      channels: { whatsapp: { allowFrom: ["*"] } },
+    } satisfies OpenClawConfig);
+
+    await monitorWebChannel(
+      false,
+      async ({ onMessage }) => {
+        await onMessage({
+          id: "typing-early",
+          from: "+1000",
+          conversationId: "+1000",
+          to: "+2000",
+          body: "hello",
+          timestamp: Date.now(),
+          chatType: "direct",
+          chatId: "direct:+1000",
+          accountId: "default",
+          sendComposing,
+          reply: vi.fn(async () => undefined),
+          sendMedia: vi.fn(async () => undefined),
+        });
+        return createMockWebListener();
+      },
+      false,
+      replyResolver,
+    );
+
+    resetLoadConfigMock();
+
+    expect(replyResolver).toHaveBeenCalledTimes(1);
+    expect(sendComposing).toHaveBeenCalledTimes(1);
   });
 });

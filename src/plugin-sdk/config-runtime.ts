@@ -49,6 +49,7 @@ export { resolveActiveTalkProviderConfig } from "../config/talk.js";
 export { resolveAgentMaxConcurrent } from "../config/agent-limits.js";
 export { loadCronStore, resolveCronStorePath, saveCronStore } from "../cron/store.js";
 export { applyModelOverrideToSessionEntry } from "../sessions/model-overrides.js";
+export { resolveSendPolicy } from "../sessions/send-policy.js";
 export { coerceSecretRef } from "../config/types.secrets.js";
 export {
   resolveConfiguredSecretInputString,
@@ -98,6 +99,7 @@ export type {
 export {
   clearSessionStoreCacheForTest,
   loadSessionStore,
+  loadSessionStoreAsync,
   readSessionUpdatedAt,
   recordSessionMetaFromInbound,
   saveSessionStore,
