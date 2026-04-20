@@ -53,6 +53,12 @@ function resolveWhatsAppDisableBlockStreaming(cfg: ReturnType<LoadConfigFn>): bo
   return !cfg.channels.whatsapp.blockStreaming;
 }
 
+function resolveWhatsAppTypingIntervalSeconds(cfg: ReturnType<LoadConfigFn>): number | undefined {
+  const configuredTypingSeconds =
+    cfg.agents?.defaults?.typingIntervalSeconds ?? cfg.session?.typingIntervalSeconds;
+  return typeof configuredTypingSeconds === "number" ? configuredTypingSeconds : undefined;
+}
+
 function shouldSuppressWhatsAppPayload(
   payload: ReplyPayload,
   info: { kind: ReplyLifecycleKind },
@@ -236,7 +242,7 @@ export async function dispatchWhatsAppBufferedReply(params: {
   maxMediaBytes: number;
   maxMediaTextChunkLimit?: number;
   msg: WebInboundMsg;
-  onModelSelected?: ChannelReplyOnModelSelected | undefined;
+  onModelSelected?: ChannelReplyOnModelSelected;
   rememberSentText: (
     text: string | undefined,
     opts: {
@@ -262,52 +268,59 @@ export async function dispatchWhatsAppBufferedReply(params: {
   const disableBlockStreaming = resolveWhatsAppDisableBlockStreaming(params.cfg);
   let didSendReply = false;
   let didLogHeartbeatStrip = false;
+  const dispatcherOptions = {
+    ...params.replyPipeline,
+    // WhatsApp UX is especially sensitive to cold-start silence. Start
+    // composing as soon as this inbound message has passed channel gating.
+    earlyTyping: {
+      start: "accepted_inbound" as const,
+      typingIntervalSeconds: resolveWhatsAppTypingIntervalSeconds(params.cfg),
+    },
+    onHeartbeatStrip: () => {
+      if (!didLogHeartbeatStrip) {
+        didLogHeartbeatStrip = true;
+        logVerbose("Stripped stray HEARTBEAT_OK token from web reply");
+      }
+    },
+    deliver: async (payload: ReplyPayload, info: { kind: ReplyLifecycleKind }) => {
+      if (shouldSuppressWhatsAppPayload(payload, info)) {
+        return;
+      }
+      await params.deliverReply({
+        replyResult: payload,
+        msg: params.msg,
+        mediaLocalRoots,
+        maxMediaBytes: params.maxMediaBytes,
+        textLimit,
+        chunkMode,
+        replyLogger: params.replyLogger,
+        connectionId: params.connectionId,
+        skipLog: false,
+        tableMode,
+      });
+      didSendReply = true;
+      const shouldLog = payload.text ? true : undefined;
+      params.rememberSentText(payload.text, {
+        combinedBody: params.context.Body as string | undefined,
+        combinedBodySessionKey: params.route.sessionKey,
+        logVerboseMessage: shouldLog,
+      });
+      const fromDisplay =
+        params.msg.chatType === "group" ? params.conversationId : (params.msg.from ?? "unknown");
+      const reply = resolveSendableOutboundReplyParts(payload);
+      if (shouldLogVerbose()) {
+        const preview = payload.text != null ? reply.text : "<media>";
+        logVerbose(`Reply body: ${preview}${reply.hasMedia ? " (media)" : ""} -> ${fromDisplay}`);
+      }
+    },
+    onReplyStart: params.msg.sendComposing,
+  };
 
   const { queuedFinal, counts } = await dispatchReplyWithBufferedBlockDispatcher({
     ctx: params.context,
     cfg: params.cfg,
     replyResolver: params.replyResolver,
-    dispatcherOptions: {
-      ...params.replyPipeline,
-      onHeartbeatStrip: () => {
-        if (!didLogHeartbeatStrip) {
-          didLogHeartbeatStrip = true;
-          logVerbose("Stripped stray HEARTBEAT_OK token from web reply");
-        }
-      },
-      deliver: async (payload: ReplyPayload, info: { kind: ReplyLifecycleKind }) => {
-        if (shouldSuppressWhatsAppPayload(payload, info)) {
-          return;
-        }
-        await params.deliverReply({
-          replyResult: payload,
-          msg: params.msg,
-          mediaLocalRoots,
-          maxMediaBytes: params.maxMediaBytes,
-          textLimit,
-          chunkMode,
-          replyLogger: params.replyLogger,
-          connectionId: params.connectionId,
-          skipLog: false,
-          tableMode,
-        });
-        didSendReply = true;
-        const shouldLog = payload.text ? true : undefined;
-        params.rememberSentText(payload.text, {
-          combinedBody: params.context.Body as string | undefined,
-          combinedBodySessionKey: params.route.sessionKey,
-          logVerboseMessage: shouldLog,
-        });
-        const fromDisplay =
-          params.msg.chatType === "group" ? params.conversationId : (params.msg.from ?? "unknown");
-        const reply = resolveSendableOutboundReplyParts(payload);
-        if (shouldLogVerbose()) {
-          const preview = payload.text != null ? reply.text : "<media>";
-          logVerbose(`Reply body: ${preview}${reply.hasMedia ? " (media)" : ""} -> ${fromDisplay}`);
-        }
-      },
-      onReplyStart: params.msg.sendComposing,
-    },
+    dispatcherOptions,
     replyOptions: {
       disableBlockStreaming,
       onModelSelected: params.onModelSelected,
