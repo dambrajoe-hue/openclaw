@@ -293,7 +293,15 @@ export async function runTui(opts: TuiOptions) {
       return activeChatRunId;
     },
     set activeChatRunId(value) {
+      const previous = activeChatRunId;
       activeChatRunId = value;
+      // When a run transitions from active → idle, give the external-session
+      // watcher a chance to flush any deferred notifies (writes that landed
+      // during the active run). Done via the wrapper rather than per-setter
+      // site to cover every exit path (normal end, abort, error).
+      if (previous != null && value == null) {
+        externalWatcher?.onRunEnded();
+      }
     },
     get pendingOptimisticUserMessage() {
       return pendingOptimisticUserMessage;
@@ -735,6 +743,12 @@ export async function runTui(opts: TuiOptions) {
   // (inbox wake-handlers, crons, sibling agents) appends to the session JSONL.
   // Without this, async work that lands in the session is invisible until the
   // user fires the next turn.
+  //
+  // The watcher is gated on `isRunActive`: while the TUI's own turn is
+  // streaming, the gateway writes deltas/tool-events into the same JSONL many
+  // times per second. Without gating, every write triggers a loadHistory that
+  // hammers chat.history/sessions.list and starves the agent's LLM calls.
+  // Deferred notifies flush via onRunEnded() when the turn settles.
   let externalWatcher: SessionJsonlWatcher | null = null;
   const loadHistory = async (): Promise<void> => {
     await baseLoadHistory();
@@ -743,6 +757,7 @@ export async function runTui(opts: TuiOptions) {
     }
   };
   externalWatcher = new SessionJsonlWatcher({
+    isRunActive: () => activeChatRunId != null,
     onExternalWrite: () => {
       setConnectionStatus("session updated externally — refreshing", 3000);
       void loadHistory();

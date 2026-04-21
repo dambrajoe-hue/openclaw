@@ -44,21 +44,19 @@ describe("SessionJsonlWatcher", () => {
     await fs.rm(tempStateDir, { recursive: true, force: true });
   });
 
-  it("fires onExternalWrite (debounced) when the session file is appended to", async () => {
+  it("fires onExternalWrite (debounced) when idle and the session file is appended", async () => {
     const onExternalWrite = vi.fn();
-    watcher = new SessionJsonlWatcher({ onExternalWrite });
+    watcher = new SessionJsonlWatcher({ onExternalWrite, isRunActive: () => false });
     await watcher.start(AGENT_ID, SESSION_ID);
-    // Give chokidar a moment to install the watcher reliably.
     await delay(150);
     await fs.appendFile(sessionFilePath, '{"type":"message","role":"assistant"}\n', "utf8");
-    // Debounce is 500ms; allow buffer for awaitWriteFinish + scheduling jitter.
     await delay(1500);
     expect(onExternalWrite).toHaveBeenCalledTimes(1);
   });
 
   it("coalesces a burst of writes into a single callback", async () => {
     const onExternalWrite = vi.fn();
-    watcher = new SessionJsonlWatcher({ onExternalWrite });
+    watcher = new SessionJsonlWatcher({ onExternalWrite, isRunActive: () => false });
     await watcher.start(AGENT_ID, SESSION_ID);
     await delay(150);
     for (let i = 0; i < 5; i++) {
@@ -71,7 +69,7 @@ describe("SessionJsonlWatcher", () => {
 
   it("does not fire after stop()", async () => {
     const onExternalWrite = vi.fn();
-    watcher = new SessionJsonlWatcher({ onExternalWrite });
+    watcher = new SessionJsonlWatcher({ onExternalWrite, isRunActive: () => false });
     await watcher.start(AGENT_ID, SESSION_ID);
     await delay(150);
     await watcher.stop();
@@ -83,7 +81,7 @@ describe("SessionJsonlWatcher", () => {
 
   it("is a no-op when started twice with the same agent+session", async () => {
     const onExternalWrite = vi.fn();
-    watcher = new SessionJsonlWatcher({ onExternalWrite });
+    watcher = new SessionJsonlWatcher({ onExternalWrite, isRunActive: () => false });
     await watcher.start(AGENT_ID, SESSION_ID);
     await delay(150);
     await watcher.start(AGENT_ID, SESSION_ID);
@@ -91,6 +89,45 @@ describe("SessionJsonlWatcher", () => {
     await fs.appendFile(sessionFilePath, '{"x":1}\n', "utf8");
     await delay(1500);
     expect(onExternalWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it("defers onExternalWrite while a run is active; does NOT call loadHistory mid-turn", async () => {
+    const onExternalWrite = vi.fn();
+    let runActive = true;
+    watcher = new SessionJsonlWatcher({ onExternalWrite, isRunActive: () => runActive });
+    await watcher.start(AGENT_ID, SESSION_ID);
+    await delay(150);
+    // Simulate Alfred's streaming writes during an active run.
+    for (let i = 0; i < 10; i++) {
+      await fs.appendFile(sessionFilePath, `{"delta":${i}}\n`, "utf8");
+      await delay(60);
+    }
+    await delay(1500);
+    expect(onExternalWrite).not.toHaveBeenCalled();
+  });
+
+  it("flushes one pending notify via onRunEnded() after the run settles", async () => {
+    const onExternalWrite = vi.fn();
+    let runActive = true;
+    watcher = new SessionJsonlWatcher({ onExternalWrite, isRunActive: () => runActive });
+    await watcher.start(AGENT_ID, SESSION_ID);
+    await delay(150);
+    await fs.appendFile(sessionFilePath, '{"during":"run"}\n', "utf8");
+    await delay(1000);
+    expect(onExternalWrite).not.toHaveBeenCalled();
+    runActive = false;
+    watcher.onRunEnded();
+    expect(onExternalWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it("onRunEnded() is a no-op when no writes were deferred", async () => {
+    const onExternalWrite = vi.fn();
+    watcher = new SessionJsonlWatcher({ onExternalWrite, isRunActive: () => false });
+    await watcher.start(AGENT_ID, SESSION_ID);
+    await delay(150);
+    watcher.onRunEnded();
+    watcher.onRunEnded();
+    expect(onExternalWrite).not.toHaveBeenCalled();
   });
 });
 
